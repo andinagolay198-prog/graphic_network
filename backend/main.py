@@ -94,7 +94,7 @@ def list_devices():
     return list(devices_db.values())
 
 @app.post("/api/devices")
-def add_device(device: DeviceCreate):
+async def add_device(device: DeviceCreate, background_tasks: BackgroundTasks):
     d = device.dict()
     d["status"] = "offline"
     d["model"] = ""
@@ -104,7 +104,37 @@ def add_device(device: DeviceCreate):
     d["created_at"] = datetime.now().isoformat()
     devices_db[device.name] = d
     save_db()
+    # Auto-connect in background
+    background_tasks.add_task(_auto_connect, device.name)
     return {"status": "created", "device": d}
+
+async def _auto_connect(name: str):
+    """Auto-connect sau khi add thiết bị"""
+    await asyncio.sleep(1)
+    try:
+        device = devices_db.get(name)
+        if not device: return
+        vendor = device.get("vendor","")
+        if vendor == "mikrotik":
+            result = await _mikrotik_connect(device)
+        elif vendor == "cisco":
+            result = await _cisco_connect(device)
+        elif vendor == "fortinet":
+            result = await _fortinet_connect(device)
+        elif vendor == "sophos":
+            result = await _sophos_connect(device)
+        else:
+            return
+        devices_db[name]["status"] = "online"
+        for k in ["model","uptime","cpu","mem","identity"]:
+            if k in result: devices_db[name][k] = result[k]
+        save_db()
+        print(f"[AUTO-CONNECT] ✓ {name} connected ({vendor})")
+        await check_and_alert_status_change(name, "online")
+    except Exception as e:
+        devices_db[name]["status"] = "offline"
+        save_db()
+        print(f"[AUTO-CONNECT] ✗ {name} failed: {e}")
 
 @app.put("/api/devices/{name}")
 def update_device(name: str, device: DeviceCreate):
@@ -274,54 +304,6 @@ async def ping_host(req: PingRequest):
     except Exception as e:
         raise HTTPException(400, str(e))
 
-@app.post("/api/devices/{name}/ping")
-async def device_ping(name: str, req: PingRequest):
-    """Ping từ thiết bị (MikroTik) đến host"""
-    if name not in devices_db:
-        raise HTTPException(404, f"Device '{name}' not found")
-    device = devices_db[name]
-    if device.get("status") != "online":
-        raise HTTPException(400, "Device offline")
-    vendor = device.get("vendor", "").lower()
-    try:
-        if vendor == "mikrotik":
-            src = getattr(req, "src", None) or ""
-            output = await asyncio.to_thread(_mikrotik_ping, device, req.host, req.count, src)
-        elif vendor == "cisco":
-            output = await cmd_cisco(device, f"ping {req.host} repeat {req.count}")
-        else:
-            output = await cmd_ssh_generic(device, f"ping -c {req.count} {req.host}")
-        return {"status": "ok", "output": output}
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-@app.post("/api/devices/{name}/traceroute")
-async def device_traceroute(name: str, req: PingRequest):
-    """Traceroute từ thiết bị MikroTik đến host — chỉ dùng RouterOS API"""
-    if name not in devices_db:
-        raise HTTPException(404, f"Device '{name}' not found")
-    device = devices_db[name]
-    if device.get("status") != "online":
-        raise HTTPException(400, "Device offline")
-    vendor = device.get("vendor", "").lower()
-    try:
-        if vendor == "mikrotik":
-            output = await asyncio.to_thread(_mikrotik_traceroute, device, req.host)
-        else:
-            raise HTTPException(400, f"Traceroute từ thiết bị chưa hỗ trợ vendor {vendor}")
-        return {"status": "ok", "output": output}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-@app.post("/api/network/traceroute")
-async def traceroute_host(req: PingRequest):
-    try:
-        result = await do_traceroute(req.host)
-        return result
-    except Exception as e:
-        raise HTTPException(400, str(e))
 
 @app.post("/api/devices/{name}/traceroute")
 async def device_traceroute(name: str, req: PingRequest):
@@ -784,83 +766,6 @@ def _mikrotik_ping(device: dict, host: str, count: int = 4, src: str = "") -> st
 
 
 
-def _mikrotik_traceroute(device: dict, host: str, max_hops: int = 15) -> str:
-    """
-    Traceroute từ MikroTik qua RouterOS API.
-    Thử /tool/traceroute resource, nếu không được thì fallback ping-route.
-    """
-    try:
-        import routeros_api
-        conn = routeros_api.RouterOsApiPool(
-            host=device['host'],
-            username=device['username'],
-            password=device['password'],
-            port=device.get('api_port', 3543),
-            use_ssl=device.get('use_ssl', False),
-            ssl_verify=device.get('verify_ssl', False),
-            plaintext_login=True,
-        )
-        api = conn.get_api()
-
-        # Thử /tool/traceroute qua API
-        try:
-            params = {'address': host, 'count': '1', 'max-hops': str(max_hops)}
-            results = list(api.get_resource('/tool/traceroute').call('', params))
-            conn.disconnect()
-            if results:
-                out = ['  Traceroute to ' + host + ', max ' + str(max_hops) + ' hops:', '']
-                for r in results:
-                    hop    = str(r.get('n', r.get('#', '?'))).rjust(2)
-                    addr   = r.get('address', r.get('host', '*'))
-                    rtt    = r.get('avg', r.get('time', r.get('last', '?')))
-                    loss   = r.get('loss', '')
-                    status = r.get('status', '')
-                    if status == 'timeout' or addr in ('', '0.0.0.0'):
-                        out.append('  ' + hop + '   * * *  (timeout)')
-                    else:
-                        loss_str = ('  loss=' + loss) if loss else ''
-                        out.append('  ' + hop + '   ' + str(rtt) + '   ' + str(addr) + loss_str)
-                return chr(10).join(out)
-        except Exception:
-            pass  # fallback bên dưới
-
-        # Fallback: đọc route table + ping để mô phỏng
-        out = ['  Traceroute to ' + host + ' (ping-route fallback):', '']
-        try:
-            routes = list(api.get_resource('/ip/route').get())
-            conn.disconnect()
-            gateway = None
-            for r in routes:
-                if r.get('dst-address', '') in ('0.0.0.0/0', ''):
-                    gateway = r.get('gateway', '')
-                    break
-            hop_n = 1
-            if gateway:
-                out.append('  ' + str(hop_n).rjust(2) + '   ~1ms   ' + gateway + '  (gateway)')
-                hop_n += 1
-            ping_out = _mikrotik_ping(device, host, count=1)
-            if 'bytes from' in ping_out or 'seq=' in ping_out:
-                if hop_n < 3:
-                    out.append('  ' + str(hop_n).rjust(2) + '   ...    (ISP hops)')
-                    hop_n += 1
-                out.append('  ' + str(hop_n).rjust(2) + '   OK     ' + host + '  (reached)')
-            else:
-                out.append('  ' + str(hop_n).rjust(2) + '   * * *  ' + host + '  (unreachable)')
-            out.append('')
-            out.append('  [Note: /tool/traceroute yeu cau RouterOS 7+ va quyen admin]')
-            return chr(10).join(out)
-        except Exception as e2:
-            try:
-                conn.disconnect()
-            except Exception:
-                pass
-            return ('  Traceroute to ' + host + chr(10) +
-                    '  Khong ho tro /tool/traceroute tren RouterOS nay.' + chr(10) +
-                    '  Chi tiet: ' + str(e2))
-    except ImportError:
-        raise Exception('pip install routeros-api')
-    except Exception as e:
-        raise Exception('Traceroute that bai: ' + str(e))
 
 
 def _mikrotik_traceroute(device: dict, host: str, max_hops: int = 15) -> str:
@@ -2304,22 +2209,126 @@ device_prev_status: Dict[str, str] = {}  # track status changes for alerts
 # STARTUP CLEANUP — runs AFTER all variables declared
 # ══════════════════════════════════════════════════════════════════
 def _startup_cleanup():
-    # 1. Close any lingering serial sessions
-    for sid, sess in list(serial_sessions.items()):
-        try: sess["serial"].close()
-        except: pass
     serial_sessions.clear()
-
-    # 2. Reset polling
     global polling_active, polling_offset
     polling_active = False
     polling_offset = 0
-
-    # 3. Clear device status cache
     device_prev_status.clear()
-    print("[STARTUP] ✓ Cleanup done — serial/polling/cache cleared")
+    print("[STARTUP] Cleanup done")
 
+
+# ── Background Health-Check ──────────────────────────────────────
+import threading as _hc_threading
+
+def _health_check_loop():
+    """Ping tất cả thiết bị mỗi 60s — tự phát hiện online/offline"""
+    import time as _t
+    import asyncio as _asyncio
+    _t.sleep(10)  # Chờ backend khởi động xong
+    print("[HEALTH-CHECK] Started — interval 60s")
+    while True:
+        try:
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+            for name, device in list(devices_db.items()):
+                try:
+                    vendor = device.get("vendor","")
+                    prev = device.get("status","offline")
+                    ok = False
+                    # Quick TCP ping để check
+                    import socket
+                    host = device.get("host","")
+                    # Chọn port check theo vendor
+                    if vendor == "mikrotik":
+                        port = device.get("api_port", 3543)
+                    elif vendor == "fortinet":
+                        port = 443
+                    elif vendor == "sophos":
+                        port = 4444
+                    else:
+                        port = device.get("port", 22)
+                    try:
+                        sock = socket.create_connection((host, port), timeout=5)
+                        sock.close()
+                        ok = True
+                    except: ok = False
+
+                    new_status = "online" if ok else "offline"
+                    if new_status != prev:
+                        devices_db[name]["status"] = new_status
+                        save_db()
+                        print(f"[HEALTH-CHECK] {name}: {prev} → {new_status}")
+                        loop.run_until_complete(
+                            check_and_alert_status_change(name, new_status)
+                        )
+                        # Nếu back online → reconnect để lấy metrics
+                except Exception as e:
+                    print(f"[HEALTH-CHECK] {name} error: {e}")
+            loop.close()
+        except Exception as e:
+            print(f"[HEALTH-CHECK] Loop error: {e}")
+        _t.sleep(60)
+
+_hc_thread = _hc_threading.Thread(target=_health_check_loop, daemon=True)
+_hc_thread.start()
+print("[STARTUP] ✓ Health-check thread started (60s interval)")
 _startup_cleanup()
+
+# ── Background Health-Check ──────────────────────────────────────
+import threading as _hc_threading
+
+def _health_check_loop():
+    """Ping tất cả thiết bị mỗi 60s — tự phát hiện online/offline"""
+    import time as _t
+    import asyncio as _asyncio
+    _t.sleep(10)  # Chờ backend khởi động xong
+    print("[HEALTH-CHECK] Started — interval 60s")
+    while True:
+        try:
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+            for name, device in list(devices_db.items()):
+                try:
+                    vendor = device.get("vendor","")
+                    prev = device.get("status","offline")
+                    ok = False
+                    # Quick TCP ping để check
+                    import socket
+                    host = device.get("host","")
+                    # Chọn port check theo vendor
+                    if vendor == "mikrotik":
+                        port = device.get("api_port", 3543)
+                    elif vendor == "fortinet":
+                        port = 443
+                    elif vendor == "sophos":
+                        port = 4444
+                    else:
+                        port = device.get("port", 22)
+                    try:
+                        sock = socket.create_connection((host, port), timeout=5)
+                        sock.close()
+                        ok = True
+                    except: ok = False
+
+                    new_status = "online" if ok else "offline"
+                    if new_status != prev:
+                        devices_db[name]["status"] = new_status
+                        save_db()
+                        print(f"[HEALTH-CHECK] {name}: {prev} → {new_status}")
+                        loop.run_until_complete(
+                            check_and_alert_status_change(name, new_status)
+                        )
+                        # Nếu back online → reconnect để lấy metrics
+                except Exception as e:
+                    print(f"[HEALTH-CHECK] {name} error: {e}")
+            loop.close()
+        except Exception as e:
+            print(f"[HEALTH-CHECK] Loop error: {e}")
+        _t.sleep(60)
+
+_hc_thread = _hc_threading.Thread(target=_health_check_loop, daemon=True)
+_hc_thread.start()
+print("[STARTUP] ✓ Health-check thread started (60s interval)")
 
 # ── Shutdown: cleanup on Ctrl+C / process exit ───────────────────
 import atexit
@@ -2513,7 +2522,13 @@ async def bot_test(req: dict):
                 "/ping <host> — Ping host\n"
                 "/connect <name> — Connect thiết bị\n"
                 "/cmd <device> <command> — Chạy lệnh\n"
-                "/services <device> — Xem services"
+                "/services <device> — Xem services\n"
+                "\n📊 <b>Monitor:</b>\n"
+                "/status — CPU/mem tất cả thiết bị\n"
+                "/iface <device> — Traffic live interfaces\n"
+                "/cpu <device> [1h|6h|24h] — Đồ thị CPU\n"
+                "/monitor <device> <30|60|300> — Bật poll\n"
+                "/alert <device> cpu=80 mem=85 bw=900 — Ngưỡng cảnh báo"
             )}
 
         elif text.startswith("/connect "):
@@ -2784,7 +2799,6 @@ async def check_and_alert_status_change(name: str, new_status: str):
     if prev and prev != new_status:
         if new_status == "offline":
             await send_alert_all(f"🔴 <b>ALERT: {name} went OFFLINE</b>\n⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
-        elif new_status == "online":
             await send_alert_all(f"🟢 <b>ALERT: {name} back ONLINE</b>\n⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
     device_prev_status[name] = new_status
 
@@ -2923,6 +2937,11 @@ def run_polling():
                             send_msg(chat_id, f"💻 <b>{dname}</b>\n<code>{cmd}</code>\n<pre>{str(out)[:800]}</pre>")
                         except Exception as e:
                             send_msg(chat_id, f"❌ {e}")
+            elif text.startswith(("/iface", "/cpu ", "/alert ", "/monitor ")):
+                # Monitor commands qua asyncio
+                asyncio.run_coroutine_threadsafe(
+                    _handle_monitor_commands(chat_id, text), loop
+                )
             else:
                 send_msg(chat_id, f"❓ Lệnh không nhận ra. Dùng /help")
         except Exception as e:
@@ -3082,4 +3101,717 @@ async def serial_ws(websocket: WebSocket, session_id: str):
     finally:
         alive = False
         print(f"[WS] Closed: {session_id}")
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# MONITORING ENGINE — InfluxDB + Poll + Threshold Alerts
+# ══════════════════════════════════════════════════════════════════
+
+import threading
+from datetime import datetime, timezone
+
+# ── InfluxDB config ───────────────────────────────────────────────
+INFLUX_URL    = os.environ.get("INFLUX_URL",    "http://localhost:8086")
+INFLUX_TOKEN  = os.environ.get("INFLUX_TOKEN",  "plnetwork-token")
+INFLUX_ORG    = os.environ.get("INFLUX_ORG",    "plnetwork")
+INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET", "metrics")
+
+def _influx_client():
+    try:
+        from influxdb_client import InfluxDBClient
+        return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+    except ImportError:
+        raise Exception("pip install influxdb-client")
+
+def influx_write(records: list):
+    """Write list of Point objects to InfluxDB"""
+    try:
+        from influxdb_client import InfluxDBClient
+        from influxdb_client.client.write_api import SYNCHRONOUS
+        with InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG) as client:
+            write_api = client.write_api(write_options=SYNCHRONOUS)
+            write_api.write(bucket=INFLUX_BUCKET, record=records)
+    except Exception as e:
+        print(f"[InfluxDB write] {e}")
+
+def influx_query(flux: str) -> list:
+    """Run Flux query, return list of dicts"""
+    try:
+        from influxdb_client import InfluxDBClient
+        with InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG) as client:
+            tables = client.query_api().query(flux)
+            rows = []
+            for table in tables:
+                for record in table.records:
+                    rows.append({
+                        "time":  record.get_time().isoformat(),
+                        "field": record.get_field(),
+                        "value": record.get_value(),
+                        "tags":  dict(record.values),
+                    })
+            return rows
+    except Exception as e:
+        print(f"[InfluxDB query] {e}")
+        return []
+
+# ── Previous interface counters (để tính bandwidth delta) ─────────
+_prev_counters: Dict[str, dict] = {}   # key: "device:iface"
+_prev_ts: Dict[str, float] = {}        # key: "device:iface"
+
+def _collect_mikrotik(name: str, device: dict):
+    """
+    Poll MikroTik qua RouterOS API:
+    - /system/resource → cpu, memory
+    - /interface       → rx/tx bytes per interface → bandwidth Mbps
+    Ghi vào InfluxDB.
+    """
+    try:
+        import routeros_api
+        from influxdb_client import Point
+        conn = routeros_api.RouterOsApiPool(
+            host=device["host"],
+            username=device["username"],
+            password=device["password"],
+            port=device.get("api_port", 3543),
+            use_ssl=device.get("use_ssl", False),
+            ssl_verify=device.get("verify_ssl", False),
+            plaintext_login=True,
+        )
+        api  = conn.get_api()
+        now  = datetime.now(timezone.utc)
+        points = []
+
+        # ── CPU / Memory ─────────────────────────────────────────
+        res = list(api.get_resource("/system/resource").get())[0]
+        cpu      = float(res.get("cpu-load", 0))
+        mem_tot  = int(res.get("total-memory", 1))
+        mem_free = int(res.get("free-memory",  0))
+        mem_pct  = round((1 - mem_free / mem_tot) * 100, 1) if mem_tot else 0
+        hdd_tot  = int(res.get("total-hdd-space", 1))
+        hdd_free = int(res.get("free-hdd-space",  0))
+        hdd_pct  = round((1 - hdd_free / hdd_tot) * 100, 1) if hdd_tot else 0
+        uptime   = res.get("uptime", "")
+
+        points.append(
+            Point("system")
+            .tag("device", name)
+            .tag("vendor", "mikrotik")
+            .field("cpu",     cpu)
+            .field("mem",     mem_pct)
+            .field("hdd",     hdd_pct)
+            .field("uptime",  uptime)
+            .time(now)
+        )
+
+        # Cập nhật live vào devices_db
+        devices_db[name]["cpu"] = cpu
+        devices_db[name]["mem"] = mem_pct
+
+        # ── Interface traffic ─────────────────────────────────────
+        ifaces = list(api.get_resource("/interface").get())
+        conn.disconnect()
+        ts_now = now.timestamp()
+
+        for iface in ifaces:
+            iface_name = iface.get("name", "")
+            if not iface_name:
+                continue
+            rx_bytes = int(iface.get("rx-byte", 0))
+            tx_bytes = int(iface.get("tx-byte", 0))
+            rx_drop  = int(iface.get("rx-drop",  0))
+            tx_drop  = int(iface.get("tx-drop",  0))
+            rx_err   = int(iface.get("rx-error", 0))
+            tx_err   = int(iface.get("tx-error", 0))
+            running  = iface.get("running", "false") == "true"
+            disabled = iface.get("disabled", "false") == "true"
+
+            key = f"{name}:{iface_name}"
+            rx_mbps = tx_mbps = 0.0
+
+            if key in _prev_counters and key in _prev_ts:
+                dt = ts_now - _prev_ts[key]
+                if dt > 0:
+                    prev = _prev_counters[key]
+                    rx_delta = max(0, rx_bytes - prev.get("rx", 0))
+                    tx_delta = max(0, tx_bytes - prev.get("tx", 0))
+                    rx_mbps  = round(rx_delta * 8 / dt / 1_000_000, 4)
+                    tx_mbps  = round(tx_delta * 8 / dt / 1_000_000, 4)
+
+            _prev_counters[key] = {"rx": rx_bytes, "tx": tx_bytes}
+            _prev_ts[key]       = ts_now
+
+            points.append(
+                Point("interface")
+                .tag("device",    name)
+                .tag("iface",     iface_name)
+                .tag("vendor",    "mikrotik")
+                .field("rx_mbps",  rx_mbps)
+                .field("tx_mbps",  tx_mbps)
+                .field("rx_bytes", rx_bytes)
+                .field("tx_bytes", tx_bytes)
+                .field("rx_drop",  rx_drop)
+                .field("tx_drop",  tx_drop)
+                .field("rx_error", rx_err)
+                .field("tx_error", tx_err)
+                .field("running",  1 if running else 0)
+                .field("disabled", 1 if disabled else 0)
+                .time(now)
+            )
+
+        influx_write(points)
+        print(f"[Monitor] {name} — cpu={cpu}% mem={mem_pct}% ifaces={len(ifaces)}")
+
+        # ── Kiểm tra ngưỡng alert ─────────────────────────────────
+        _check_thresholds(name, cpu=cpu, mem=mem_pct, interfaces=ifaces)
+
+    except Exception as e:
+        print(f"[Monitor] {name} poll error: {e}")
+
+
+def _collect_device(name: str, device: dict):
+    """Dispatch collection theo vendor"""
+    vendor = device.get("vendor", "").lower()
+    if device.get("status") != "online":
+        return
+    if vendor == "mikrotik":
+        _collect_mikrotik(name, device)
+    # TODO: cisco, fortinet, sophos — dùng SNMP hoặc SSH/API tương tự
+
+
+# ── Threshold config ──────────────────────────────────────────────
+THRESHOLD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json")
+_thresholds: dict = {}          # {device_name: {cpu, mem, bw_mbps, ...}}
+_alert_cooldown: dict = {}      # {key: last_alert_ts}
+ALERT_COOLDOWN_SEC = 300        # 5 phút không spam
+
+def _load_thresholds():
+    global _thresholds
+    if os.path.exists(THRESHOLD_FILE):
+        try:
+            with open(THRESHOLD_FILE) as f:
+                _thresholds = json.load(f)
+        except:
+            _thresholds = {}
+
+def _save_thresholds():
+    with open(THRESHOLD_FILE, "w") as f:
+        json.dump(_thresholds, f, indent=2)
+
+_load_thresholds()
+
+def _check_thresholds(name: str, cpu: float, mem: float, interfaces: list):
+    """So sánh với ngưỡng đã cấg hình, gửi Telegram nếu vượt"""
+    import asyncio, time as _time
+    cfg = _thresholds.get(name, {})
+    if not cfg:
+        return
+
+    def _alert(key: str, msg: str):
+        now = _time.time()
+        last = _alert_cooldown.get(key, 0)
+        if now - last < ALERT_COOLDOWN_SEC:
+            return
+        _alert_cooldown[key] = now
+        full_msg = f"⚠️ <b>PlNetwork Alert</b>\n🖥 <b>{name}</b>\n{msg}"
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(send_alert_all(full_msg), loop)
+        except Exception as e:
+            print(f"[Alert] {e}")
+
+    # CPU
+    cpu_th = cfg.get("cpu")
+    if cpu_th and cpu > cpu_th:
+        _alert(f"{name}:cpu", f"🔴 CPU cao: <b>{cpu}%</b> (ngưỡng {cpu_th}%)")
+
+    # Memory
+    mem_th = cfg.get("mem")
+    if mem_th and mem > mem_th:
+        _alert(f"{name}:mem", f"🟠 Memory cao: <b>{mem}%</b> (ngưỡng {mem_th}%)")
+
+    # Bandwidth per interface
+    bw_th = cfg.get("bw_mbps")
+    if bw_th:
+        for iface in interfaces:
+            iface_name = iface.get("name", "")
+            key = f"{name}:{iface_name}"
+            prev = _prev_counters.get(key, {})
+            # bandwidth đã tính ở _collect_mikrotik, đọc từ prev
+            # Dùng lại logic đơn giản — nếu > threshold thì alert
+            rx_bytes = int(iface.get("rx-byte", 0))
+            tx_bytes = int(iface.get("tx-byte", 0))
+            prev_rx  = prev.get("rx", 0)
+            prev_tx  = prev.get("tx", 0)
+            dt = _prev_ts.get(key, 0)
+            if dt and prev_rx:
+                elapsed = datetime.now(timezone.utc).timestamp() - dt
+                if elapsed > 0:
+                    rx_mbps = (rx_bytes - prev_rx) * 8 / elapsed / 1_000_000
+                    tx_mbps = (tx_bytes - prev_tx) * 8 / elapsed / 1_000_000
+                    if rx_mbps > bw_th:
+                        _alert(f"{name}:{iface_name}:rx",
+                               f"📶 <b>{iface_name}</b> RX cao: <b>{rx_mbps:.1f} Mbps</b> (ngưỡng {bw_th} Mbps)")
+                    if tx_mbps > bw_th:
+                        _alert(f"{name}:{iface_name}:tx",
+                               f"📶 <b>{iface_name}</b> TX cao: <b>{tx_mbps:.1f} Mbps</b> (ngưỡng {bw_th} Mbps)")
+
+    # Interface down
+    if cfg.get("iface_down", False):
+        for iface in interfaces:
+            iface_name = iface.get("name", "")
+            running    = iface.get("running", "false") == "true"
+            disabled   = iface.get("disabled", "false") == "true"
+            if not running and not disabled:
+                _alert(f"{name}:{iface_name}:down",
+                       f"🔴 Interface <b>{iface_name}</b> DOWN!")
+
+
+# ── Poll Scheduler ────────────────────────────────────────────────
+_poll_jobs:    Dict[str, threading.Timer] = {}
+_poll_active:  bool = False
+_poll_configs: Dict[str, int] = {}   # device → interval seconds
+
+def _schedule_poll(name: str, interval: int):
+    """Tạo vòng lặp poll bằng threading.Timer"""
+    def _run():
+        if not _poll_active:
+            return
+        device = devices_db.get(name)
+        if device:
+            threading.Thread(target=_collect_device, args=(name, device), daemon=True).start()
+        # Lên lịch lần tiếp theo
+        if _poll_active and name in _poll_configs:
+            t = threading.Timer(_poll_configs[name], _run)
+            t.daemon = True
+            _poll_jobs[name] = t
+            t.start()
+
+    t = threading.Timer(interval, _run)
+    t.daemon = True
+    _poll_jobs[name] = t
+    t.start()
+
+def start_monitor_all():
+    """Khởi động poll cho tất cả thiết bị đã có interval cấu hình"""
+    global _poll_active
+    _poll_active = True
+    for name, interval in _poll_configs.items():
+        if name not in _poll_jobs or not _poll_jobs[name].is_alive():
+            _schedule_poll(name, interval)
+    print(f"[Monitor] Started {len(_poll_configs)} device(s)")
+
+def stop_monitor_all():
+    global _poll_active
+    _poll_active = False
+    for t in _poll_jobs.values():
+        t.cancel()
+    _poll_jobs.clear()
+    print("[Monitor] Stopped")
+
+
+# ── Load poll config từ file ──────────────────────────────────────
+MONITOR_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_config.json")
+_monitor_cfg: dict = {}   # {device: {interval, enabled}}
+
+def _load_monitor_config():
+    global _monitor_cfg, _poll_configs
+    if os.path.exists(MONITOR_CONFIG_FILE):
+        try:
+            with open(MONITOR_CONFIG_FILE) as f:
+                _monitor_cfg = json.load(f)
+            for name, cfg in _monitor_cfg.items():
+                if cfg.get("enabled", True):
+                    _poll_configs[name] = cfg.get("interval", 60)
+        except:
+            pass
+
+def _save_monitor_config():
+    with open(MONITOR_CONFIG_FILE, "w") as f:
+        json.dump(_monitor_cfg, f, indent=2)
+
+_load_monitor_config()
+
+# Auto-start nếu đã có config
+if _poll_configs:
+    start_monitor_all()
+
+
+# ══════════════════════════════════════════════════════════════════
+# MONITOR API ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
+
+class ThresholdConfig(BaseModel):
+    cpu:        Optional[float] = None   # % vd: 80
+    mem:        Optional[float] = None   # % vd: 85
+    bw_mbps:    Optional[float] = None   # Mbps vd: 900
+    iface_down: bool = True
+
+class MonitorConfig(BaseModel):
+    interval: int  = 60      # giây: 30, 60, 300
+    enabled:  bool = True
+
+# ── Cấu hình poll interval per device ────────────────────────────
+@app.post("/api/monitor/{name}/config")
+async def set_monitor_config(name: str, cfg: MonitorConfig):
+    """Bật monitor + đặt interval cho thiết bị"""
+    if name not in devices_db:
+        raise HTTPException(404, "Device not found")
+    if cfg.interval not in (30, 60, 300):
+        raise HTTPException(400, "interval phải là 30, 60 hoặc 300 giây")
+
+    _monitor_cfg[name] = {"interval": cfg.interval, "enabled": cfg.enabled}
+    _save_monitor_config()
+
+    if cfg.enabled:
+        _poll_configs[name] = cfg.interval
+        if name in _poll_jobs:
+            _poll_jobs[name].cancel()
+        if _poll_active:
+            _schedule_poll(name, cfg.interval)
+        start_monitor_all()
+    else:
+        _poll_configs.pop(name, None)
+        if name in _poll_jobs:
+            _poll_jobs[name].cancel()
+            _poll_jobs.pop(name, None)
+
+    return {"status": "ok", "device": name, "interval": cfg.interval, "enabled": cfg.enabled}
+
+@app.get("/api/monitor/{name}/config")
+async def get_monitor_config(name: str):
+    return _monitor_cfg.get(name, {"interval": 60, "enabled": False})
+
+@app.get("/api/monitor/status")
+async def monitor_status():
+    return {
+        "active": _poll_active,
+        "devices": {
+            name: {
+                "interval": _poll_configs.get(name),
+                "enabled":  name in _poll_configs,
+                "running":  name in _poll_jobs and _poll_jobs[name].is_alive(),
+            }
+            for name in _monitor_cfg
+        }
+    }
+
+@app.post("/api/monitor/start")
+async def monitor_start():
+    start_monitor_all()
+    return {"status": "started"}
+
+@app.post("/api/monitor/stop")
+async def monitor_stop():
+    stop_monitor_all()
+    return {"status": "stopped"}
+
+# ── Threshold CRUD ────────────────────────────────────────────────
+@app.get("/api/monitor/{name}/thresholds")
+async def get_thresholds(name: str):
+    return _thresholds.get(name, {})
+
+@app.post("/api/monitor/{name}/thresholds")
+async def set_thresholds(name: str, cfg: ThresholdConfig):
+    if name not in devices_db:
+        raise HTTPException(404, "Device not found")
+    _thresholds[name] = cfg.dict(exclude_none=False)
+    _save_thresholds()
+    return {"status": "ok", "thresholds": _thresholds[name]}
+
+@app.delete("/api/monitor/{name}/thresholds")
+async def delete_thresholds(name: str):
+    _thresholds.pop(name, None)
+    _save_thresholds()
+    return {"status": "deleted"}
+
+# ── Query metrics từ InfluxDB ─────────────────────────────────────
+@app.get("/api/monitor/{name}/metrics")
+async def get_metrics(name: str, range: str = "1h", field: str = "cpu,mem"):
+    """
+    Lấy CPU/mem history.
+    range: 1h | 6h | 24h | 7d | 30d
+    field: cpu,mem,hdd (comma-separated)
+    """
+    valid_ranges = {"1h", "6h", "24h", "7d", "30d"}
+    if range not in valid_ranges:
+        raise HTTPException(400, f"range phải là: {valid_ranges}")
+
+    fields = [f.strip() for f in field.split(",")]
+    filter_fields = " or ".join(f'r["_field"] == "{f}"' for f in fields)
+
+    flux = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{range})
+  |> filter(fn: (r) => r["_measurement"] == "system")
+  |> filter(fn: (r) => r["device"] == "{name}")
+  |> filter(fn: (r) => {filter_fields})
+  |> aggregateWindow(every: {"1m" if range in ("1h","6h") else "10m" if range == "24h" else "1h"}, fn: mean, createEmpty: false)
+  |> yield(name: "mean")
+'''
+    rows = await asyncio.to_thread(influx_query, flux)
+    # Gom theo field
+    result: dict = {}
+    for row in rows:
+        f = row["field"]
+        if f not in result:
+            result[f] = []
+        result[f].append({"t": row["time"], "v": round(row["value"], 2)})
+    return {"device": name, "range": range, "data": result}
+
+@app.get("/api/monitor/{name}/interfaces")
+async def get_interface_traffic(name: str, range: str = "1h", iface: str = ""):
+    """
+    Lấy traffic (rx_mbps, tx_mbps) per interface.
+    iface: tên interface cụ thể, hoặc để trống lấy tất cả
+    """
+    valid_ranges = {"1h", "6h", "24h", "7d", "30d"}
+    if range not in valid_ranges:
+        raise HTTPException(400, f"range phải là: {valid_ranges}")
+
+    iface_filter = f'|> filter(fn: (r) => r["iface"] == "{iface}")' if iface else ""
+    window = "1m" if range in ("1h", "6h") else "10m" if range == "24h" else "1h"
+
+    flux = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{range})
+  |> filter(fn: (r) => r["_measurement"] == "interface")
+  |> filter(fn: (r) => r["device"] == "{name}")
+  |> filter(fn: (r) => r["_field"] == "rx_mbps" or r["_field"] == "tx_mbps")
+  {iface_filter}
+  |> aggregateWindow(every: {window}, fn: mean, createEmpty: false)
+  |> yield(name: "mean")
+'''
+    rows = await asyncio.to_thread(influx_query, flux)
+
+    # Gom theo iface → {rx: [...], tx: [...]}
+    result: dict = {}
+    for row in rows:
+        tags      = row.get("tags", {})
+        iface_n   = tags.get("iface", "unknown")
+        field     = row["field"]
+        if iface_n not in result:
+            result[iface_n] = {"rx": [], "tx": []}
+        key = "rx" if field == "rx_mbps" else "tx"
+        result[iface_n][key].append({"t": row["time"], "v": round(row["value"], 4)})
+
+    return {"device": name, "range": range, "interfaces": result}
+
+@app.get("/api/monitor/{name}/interfaces/live")
+async def get_interface_live(name: str):
+    """
+    Snapshot live: lấy bandwidth + status của tất cả interface ngay lúc này
+    (không qua InfluxDB — gọi thẳng RouterOS API)
+    """
+    if name not in devices_db:
+        raise HTTPException(404, "Device not found")
+    device = devices_db[name]
+    if device.get("status") != "online":
+        raise HTTPException(400, "Device offline")
+    vendor = device.get("vendor", "").lower()
+    if vendor != "mikrotik":
+        raise HTTPException(400, "Chỉ hỗ trợ MikroTik hiện tại")
+
+    try:
+        result = await asyncio.to_thread(_mikrotik_interface_snapshot, device, name)
+        return {"device": name, "interfaces": result}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+def _mikrotik_interface_snapshot(device: dict, name: str) -> list:
+    import routeros_api, time as _t
+    conn = routeros_api.RouterOsApiPool(
+        host=device["host"], username=device["username"],
+        password=device["password"], port=device.get("api_port", 3543),
+        use_ssl=device.get("use_ssl", False), ssl_verify=False,
+        plaintext_login=True,
+    )
+    api    = conn.get_api()
+    ifaces = list(api.get_resource("/interface").get())
+    conn.disconnect()
+    ts_now = _t.time()
+    result = []
+    for iface in ifaces:
+        iface_name = iface.get("name", "")
+        rx_bytes   = int(iface.get("rx-byte", 0))
+        tx_bytes   = int(iface.get("tx-byte", 0))
+        key        = f"{name}:{iface_name}"
+        rx_mbps = tx_mbps = 0.0
+        if key in _prev_counters and key in _prev_ts:
+            dt = ts_now - _prev_ts[key]
+            if dt > 0:
+                rx_mbps = round(max(0, rx_bytes - _prev_counters[key]["rx"]) * 8 / dt / 1_000_000, 3)
+                tx_mbps = round(max(0, tx_bytes - _prev_counters[key]["tx"]) * 8 / dt / 1_000_000, 3)
+        result.append({
+            "name":     iface_name,
+            "type":     iface.get("type", ""),
+            "running":  iface.get("running", "false") == "true",
+            "disabled": iface.get("disabled", "false") == "true",
+            "rx_mbps":  rx_mbps,
+            "tx_mbps":  tx_mbps,
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes,
+            "rx_drop":  int(iface.get("rx-drop", 0)),
+            "tx_drop":  int(iface.get("tx-drop", 0)),
+        })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# TELEGRAM BOT — Monitor commands
+# ══════════════════════════════════════════════════════════════════
+
+async def _handle_monitor_commands(chat_id: str, text: str) -> bool:
+    """
+    Xử lý các lệnh monitor trong Telegram bot.
+    Trả về True nếu đã xử lý, False nếu không phải lệnh monitor.
+    """
+    parts = text.strip().split()
+    cmd   = parts[0].lower() if parts else ""
+
+    # /status — tổng quan tất cả thiết bị
+    if cmd == "/status":
+        lines = ["📊 <b>PlNetwork Status</b>\n"]
+        for dname, dev in devices_db.items():
+            status  = dev.get("status", "unknown")
+            icon    = "🟢" if status == "online" else "🔴"
+            cpu     = dev.get("cpu", "?")
+            mem     = dev.get("mem", "?")
+            model   = dev.get("model", "")
+            vendor  = dev.get("vendor", "").upper()
+            mon_on  = dname in _poll_configs
+            mon_ico = "📡" if mon_on else "💤"
+            lines.append(
+                f"{icon} <b>{dname}</b> {mon_ico}\n"
+                f"   {vendor} {model}\n"
+                f"   CPU: <b>{cpu}%</b>  MEM: <b>{mem}%</b>\n"
+            )
+        await tg_send(chat_id, "\n".join(lines))
+        return True
+
+    # /iface <device> — traffic live các interface
+    if cmd == "/iface":
+        if len(parts) < 2:
+            await tg_send(chat_id, "Usage: /iface <device_name>")
+            return True
+        dname = parts[1]
+        dev   = devices_db.get(dname)
+        if not dev:
+            await tg_send(chat_id, f"❌ Không tìm thấy thiết bị: {dname}")
+            return True
+        if dev.get("status") != "online":
+            await tg_send(chat_id, f"🔴 {dname} đang offline")
+            return True
+        try:
+            ifaces = await asyncio.to_thread(_mikrotik_interface_snapshot, dev, dname)
+            lines  = [f"📶 <b>{dname}</b> — Interface Traffic Live\n"]
+            for ifc in ifaces:
+                if ifc["disabled"]:
+                    continue
+                status = "🟢" if ifc["running"] else "🔴"
+                rx     = ifc["rx_mbps"]
+                tx     = ifc["tx_mbps"]
+                lines.append(
+                    f"{status} <code>{ifc['name']:<22}</code>"
+                    f"  ↓{rx:.2f}  ↑{tx:.2f} Mbps"
+                )
+            await tg_send(chat_id, "\n".join(lines))
+        except Exception as e:
+            await tg_send(chat_id, f"❌ Lỗi: {e}")
+        return True
+
+    # /cpu <device> [range] — xem đồ thị CPU text
+    if cmd == "/cpu":
+        if len(parts) < 2:
+            await tg_send(chat_id, "Usage: /cpu <device> [1h|6h|24h]")
+            return True
+        dname = parts[1]
+        rng   = parts[2] if len(parts) > 2 else "1h"
+        flux  = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{rng})
+  |> filter(fn: (r) => r["_measurement"] == "system" and r["device"] == "{dname}" and r["_field"] == "cpu")
+  |> aggregateWindow(every: 10m, fn: mean, createEmpty: false)
+  |> yield(name: "mean")
+'''
+        rows = await asyncio.to_thread(influx_query, flux)
+        if not rows:
+            await tg_send(chat_id, f"Không có dữ liệu CPU cho {dname} trong {rng}")
+            return True
+        # Vẽ sparkline text đơn giản
+        values = [r["value"] for r in rows]
+        mn, mx = min(values), max(values)
+        avg    = sum(values) / len(values)
+        # Mini bar chart bằng Unicode
+        bars   = "▁▂▃▄▅▆▇█"
+        chart  = ""
+        for v in values[-20:]:  # 20 điểm cuối
+            idx    = int((v - mn) / (mx - mn + 0.01) * 7)
+            chart += bars[idx]
+        await tg_send(chat_id,
+            f"📈 <b>{dname}</b> CPU — {rng}\n\n"
+            f"<code>{chart}</code>\n\n"
+            f"Min: {mn:.1f}%  Avg: {avg:.1f}%  Max: {mx:.1f}%"
+        )
+        return True
+
+    # /alert <device> cpu=80 mem=85 bw=900 — cấu hình ngưỡng
+    if cmd == "/alert":
+        if len(parts) < 3:
+            await tg_send(chat_id,
+                "Usage: /alert <device> cpu=80 mem=85 bw=900\n"
+                "Ví dụ: /alert CTHO cpu=80 mem=85 bw=900")
+            return True
+        dname = parts[1]
+        cfg   = {}
+        for p in parts[2:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                try:
+                    cfg[{"bw": "bw_mbps"}.get(k, k)] = float(v)
+                except:
+                    pass
+        cfg["iface_down"] = True
+        _thresholds[dname] = cfg
+        _save_thresholds()
+        lines = [f"✅ Đã cấu hình ngưỡng cho <b>{dname}</b>:"]
+        if "cpu" in cfg:     lines.append(f"  CPU > {cfg['cpu']}%")
+        if "mem" in cfg:     lines.append(f"  MEM > {cfg['mem']}%")
+        if "bw_mbps" in cfg: lines.append(f"  Bandwidth > {cfg['bw_mbps']} Mbps")
+        lines.append("  Interface down: ✅")
+        await tg_send(chat_id, "\n".join(lines))
+        return True
+
+    # /monitor <device> <30|60|300> — bật poll
+    if cmd == "/monitor":
+        if len(parts) < 3:
+            await tg_send(chat_id, "Usage: /monitor <device> <30|60|300>")
+            return True
+        dname    = parts[1]
+        try:
+            interval = int(parts[2])
+        except:
+            interval = 60
+        if interval not in (30, 60, 300):
+            await tg_send(chat_id, "Interval phải là 30, 60 hoặc 300 giây")
+            return True
+        if dname not in devices_db:
+            await tg_send(chat_id, f"❌ Không tìm thấy: {dname}")
+            return True
+        _monitor_cfg[dname] = {"interval": interval, "enabled": True}
+        _poll_configs[dname] = interval
+        _save_monitor_config()
+        if dname in _poll_jobs:
+            _poll_jobs[dname].cancel()
+        _schedule_poll(dname, interval)
+        start_monitor_all()
+        await tg_send(chat_id,
+            f"📡 Monitor bật cho <b>{dname}</b>\n"
+            f"  Poll interval: {interval}s\n"
+            f"  CPU/mem/bandwidth sẽ được ghi vào InfluxDB"
+        )
+        return True
+
+    return False   # không phải lệnh monitor
 
