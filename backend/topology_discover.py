@@ -123,12 +123,16 @@ def _mt_neighbors(api, dev_id):
         return neighbors
 
     for item in raw:
-        iface = item.get("interface", "")
-        if not iface:
+        iface_raw = item.get("interface", "")
+        if not iface_raw:
             continue
+        # RouterOS trả "sfp-sfpplus7,Manager-Home-Server" khi neighbor
+        # thấy trên nhiều interface — lấy interface vật lý đầu tiên
+        local_iface = iface_raw.split(",")[0].strip()
+
         nb = {
-            "local_iface":    iface,
-            "neighbor_name":  item.get("identity") or item.get("system-caps-enabled", ""),
+            "local_iface":    local_iface,
+            "neighbor_name":  item.get("identity", "") or item.get("system-description", ""),
             "neighbor_ip":    item.get("address", ""),
             "neighbor_mac":   item.get("mac-address", ""),
             "neighbor_iface": item.get("interface-name", ""),
