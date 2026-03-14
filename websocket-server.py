@@ -10,6 +10,8 @@ import asyncio
 import json
 from datetime import datetime
 from typing import Set
+import httpx
+import os
 import uvicorn
 
 
@@ -67,68 +69,31 @@ async def health():
     }
 
 
+PLNETWORK_URL = os.environ.get("PLNETWORK_URL", "http://localhost:8001")
+
 @app.get("/api/topology")
 async def get_topology():
-    """Get current topology snapshot"""
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "devices": [
-            {
-                "id": "core-1",
-                "name": "Core-Router-1",
-                "type": "router",
-                "ip": "192.168.1.1",
-                "status": "up",
-                "vendor": "Mikrotik",
-                "cpu_usage": 45,
-                "memory_usage": 62,
-                "uptime": 3600000
-            },
-            {
-                "id": "fw-1",
-                "name": "Firewall-Primary",
-                "type": "firewall",
-                "ip": "192.168.1.3",
-                "status": "up",
-                "vendor": "Fortinet",
-                "cpu_usage": 28,
-                "memory_usage": 55,
-                "uptime": 2592000000
-            },
-            {
-                "id": "sw-1",
-                "name": "Switch-Main",
-                "type": "switch",
-                "ip": "192.168.2.1",
-                "status": "up",
-                "vendor": "Cisco",
-                "cpu_usage": 15,
-                "memory_usage": 42,
-                "uptime": 1209600000
-            },
-        ],
-        "links": [
-            {
-                "from": "modem-1",
-                "to": "core-1",
-                "type": "wired",
-                "bandwidth": "1Gbps",
-                "status": "active",
-                "rx_bytes": 1024000000,
-                "tx_bytes": 512000000
-            },
-            {
-                "from": "core-1",
-                "to": "fw-1",
-                "type": "wired",
-                "bandwidth": "1Gbps",
-                "status": "active",
-                "rx_bytes": 256000000,
-                "tx_bytes": 128000000
-            },
-        ]
-    }
-
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{PLNETWORK_URL}/api/devices")
+            raw = r.json()
+        devices = []
+        for dev in raw:
+            devices.append({
+                "id": dev["name"],
+                "name": dev["name"],
+                "type": "router" if dev.get("vendor")=="mikrotik" else "firewall" if dev.get("vendor") in ("fortinet","sophos") else "switch",
+                "ip": dev.get("host",""),
+                "status": "up" if dev.get("status")=="online" else "down",
+                "vendor": dev.get("vendor","").capitalize(),
+                "cpu_usage": dev.get("cpu",0),
+                "memory_usage": dev.get("mem",0),
+                "uptime": dev.get("uptime",""),
+                "model": dev.get("model",""),
+            })
+        return {"timestamp": __import__("datetime").datetime.now().isoformat(), "devices": devices, "links": []}
+    except Exception as e:
+        return {"timestamp": __import__("datetime").datetime.now().isoformat(), "devices": [], "links": [], "error": str(e)}
 
 @app.post("/api/device/{device_id}/alert")
 async def trigger_device_alert(device_id: str, alert_data: dict):

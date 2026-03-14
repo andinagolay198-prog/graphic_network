@@ -15,42 +15,32 @@ const NetworkTopologyManager = () => {
   const [devicePositions, setDevicePositions] = useState({});
 
   // Sample data - trong production sẽ lấy từ backend API
+  const TOPOLOGY_URL = 'http://localhost:8000';
+
+  const fetchTopology = async () => {
+    try {
+      const r = await fetch(`${TOPOLOGY_URL}/api/topology`);
+      const data = await r.json();
+      const devs = data.devices || [];
+      setDevices(devs);
+      setLinks(data.links || []);
+      const positions = {};
+      devs.forEach((device, index) => {
+        const angle = (index / Math.max(devs.length,1)) * 2 * Math.PI;
+        const radius = 200;
+        positions[device.id] = {
+          x: 400 + radius * Math.cos(angle),
+          y: 300 + radius * Math.sin(angle),
+        };
+      });
+      setDevicePositions(positions);
+    } catch(e) { console.error('Fetch error:', e); }
+  };
+
   useEffect(() => {
-    const sampleDevices = [
-      { id: 'core-1', name: 'Core-Router-1', type: 'router', ip: '192.168.1.1', status: 'up', vendor: 'Mikrotik' },
-      { id: 'core-2', name: 'Core-Router-2', type: 'router', ip: '192.168.1.2', status: 'up', vendor: 'Cisco' },
-      { id: 'fw-1', name: 'Firewall-Primary', type: 'firewall', ip: '192.168.1.3', status: 'up', vendor: 'Fortinet' },
-      { id: 'fw-2', name: 'Firewall-Backup', type: 'firewall', ip: '192.168.1.4', status: 'up', vendor: 'Sophos' },
-      { id: 'sw-1', name: 'Switch-Main', type: 'switch', ip: '192.168.2.1', status: 'up', vendor: 'Cisco' },
-      { id: 'sw-2', name: 'Switch-Branch', type: 'switch', ip: '192.168.2.2', status: 'down', vendor: 'Mikrotik' },
-      { id: 'ap-1', name: 'AP-Office', type: 'ap', ip: '192.168.3.1', status: 'up', vendor: 'Ubiquiti' },
-      { id: 'modem-1', name: 'Modem-ISP', type: 'modem', ip: '10.0.0.1', status: 'up', vendor: 'Generic' },
-    ];
-
-    const sampleLinks = [
-      { from: 'modem-1', to: 'core-1', type: 'wired', bandwidth: '1Gbps', status: 'active' },
-      { from: 'core-1', to: 'core-2', type: 'wired', bandwidth: '10Gbps', status: 'active' },
-      { from: 'core-1', to: 'fw-1', type: 'wired', bandwidth: '1Gbps', status: 'active' },
-      { from: 'fw-1', to: 'fw-2', type: 'tunnel', bandwidth: '500Mbps', status: 'active' },
-      { from: 'core-1', to: 'sw-1', type: 'wired', bandwidth: '1Gbps', status: 'active' },
-      { from: 'core-2', to: 'sw-2', type: 'wired', bandwidth: '100Mbps', status: 'inactive' },
-      { from: 'sw-1', to: 'ap-1', type: 'wired', bandwidth: '1Gbps', status: 'active' },
-    ];
-
-    setDevices(sampleDevices);
-    setLinks(sampleLinks);
-
-    // Initialize positions
-    const positions = {};
-    sampleDevices.forEach((device, index) => {
-      const angle = (index / sampleDevices.length) * 2 * Math.PI;
-      const radius = 200;
-      positions[device.id] = {
-        x: 400 + radius * Math.cos(angle),
-        y: 300 + radius * Math.sin(angle),
-      };
-    });
-    setDevicePositions(positions);
+    fetchTopology();
+    const timer = setInterval(fetchTopology, 30000);
+    return () => clearInterval(timer);
   }, []);
 
   // Filter devices
