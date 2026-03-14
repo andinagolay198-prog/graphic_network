@@ -2319,7 +2319,25 @@ def load_bot_config():
     if os.path.exists(BOT_CONFIG_FILE):
         try: bot_config.update(json.load(open(BOT_CONFIG_FILE, encoding="utf-8")))
         except: pass
+
 load_bot_config()
+
+# Auto-start bot polling sau khi load config
+def _auto_start_bot():
+    import time as _t
+    _t.sleep(5)  # Chờ backend khởi động xong
+    token = bot_config.get("token","")
+    if not token:
+        print("[BOT] No token configured — skip auto-start")
+        return
+    global polling_thread, polling_active, polling_offset
+    polling_offset = 0
+    polling_active = True
+    polling_thread = _hc_threading.Thread(target=run_polling, daemon=True)
+    polling_thread.start()
+    print(f"[BOT] Auto-started polling for token ...{token[-6:]}")
+
+_hc_threading.Thread(target=_auto_start_bot, daemon=True, name="bot-autostart").start()
 
 class BotConfigRequest(BaseModel):
     token: str
@@ -4021,3 +4039,225 @@ def _discover_all_sync(devices: list) -> dict:
     """
     from topology_discover import discover_all
     return discover_all(devices, max_workers=5)
+
+# ══════════════════════════════════════════════════════════════════
+# SECURITY & AUDIT
+# ══════════════════════════════════════════════════════════════════
+import hashlib, difflib
+
+AUDIT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.json")
+CONFIG_SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_snapshots.json")
+
+# Load audit log
+_audit_log: list = []
+_config_snapshots: dict = {}
+
+def _load_audit():
+    global _audit_log
+    if os.path.exists(AUDIT_FILE):
+        try:
+            with open(AUDIT_FILE) as f:
+                _audit_log = json.load(f)
+        except: _audit_log = []
+
+def _save_audit():
+    with open(AUDIT_FILE, "w") as f:
+        json.dump(_audit_log[-1000:], f, indent=2)
+
+def _load_snapshots():
+    global _config_snapshots
+    if os.path.exists(CONFIG_SNAPSHOT_FILE):
+        try:
+            with open(CONFIG_SNAPSHOT_FILE) as f:
+                _config_snapshots = json.load(f)
+        except: _config_snapshots = {}
+
+def _save_snapshots():
+    with open(CONFIG_SNAPSHOT_FILE, "w") as f:
+        json.dump(_config_snapshots, f, indent=2)
+
+_load_audit()
+_load_snapshots()
+
+def add_audit_log(action: str, device: str, user: str, detail: str, status: str = "ok"):
+    entry = {
+        "time": datetime.now().isoformat(),
+        "action": action,
+        "device": device,
+        "user": user,
+        "detail": detail,
+        "status": status,
+    }
+    _audit_log.append(entry)
+    _save_audit()
+    # Alert Telegram nếu có hành động nguy hiểm
+    if action in ("config_push","rollback","device_delete","service_change"):
+        asyncio.create_task(send_alert_all(
+            f"🔐 <b>Audit Alert</b>\n"
+            f"👤 User: <b>{user}</b>\n"
+            f"🖥 Device: <b>{device}</b>\n"
+            f"⚡ Action: <b>{action}</b>\n"
+            f"📝 {detail}"
+        ))
+
+# ── Audit Log API ─────────────────────────────────────────────────
+@app.get("/api/audit/logs")
+async def get_audit_logs(limit: int = 200, device: str = None, action: str = None):
+    logs = _audit_log[-limit:]
+    if device: logs = [l for l in logs if l.get("device") == device]
+    if action: logs = [l for l in logs if l.get("action") == action]
+    return {"logs": list(reversed(logs)), "total": len(_audit_log)}
+
+@app.delete("/api/audit/logs")
+async def clear_audit_logs():
+    global _audit_log
+    _audit_log = []
+    _save_audit()
+    return {"status": "cleared"}
+
+# ── Config Diff API ───────────────────────────────────────────────
+@app.post("/api/audit/snapshot/{name}")
+async def take_config_snapshot(name: str):
+    """Lấy config hiện tại và so sánh với snapshot trước"""
+    device = devices_db.get(name)
+    if not device: raise HTTPException(404, "Device not found")
+    try:
+        r = await api_call_device(name, "backup")
+        config = r.get("backup", "")
+    except:
+        # Fallback: lấy running config
+        try:
+            r = await api_call_device(name, "config_get")
+            config = r.get("config", "")
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    now = datetime.now().isoformat()
+    prev = _config_snapshots.get(name, {})
+    prev_config = prev.get("config", "")
+    prev_hash = prev.get("hash", "")
+    curr_hash = hashlib.md5(config.encode()).hexdigest()
+
+    diff = ""
+    changed = curr_hash != prev_hash
+    if changed and prev_config:
+        diff_lines = list(difflib.unified_diff(
+            prev_config.splitlines(),
+            config.splitlines(),
+            fromfile=f"{name} (trước)",
+            tofile=f"{name} (hiện tại)",
+            lineterm=""
+        ))
+        diff = "\n".join(diff_lines[:200])  # Max 200 dòng diff
+        # Alert nếu config thay đổi
+        await send_alert_all(
+            f"⚠️ <b>Config Changed!</b>\n"
+            f"🖥 Device: <b>{name}</b>\n"
+            f"🕐 Time: {now}\n"
+            f"📝 {len(diff_lines)} dòng thay đổi"
+        )
+        add_audit_log("config_change", name, "system", f"Config changed: {len(diff_lines)} lines diff")
+
+    _config_snapshots[name] = {
+        "config": config,
+        "hash": curr_hash,
+        "time": now,
+        "prev_hash": prev_hash,
+    }
+    _save_snapshots()
+
+    return {
+        "name": name,
+        "changed": changed,
+        "hash": curr_hash,
+        "prev_hash": prev_hash,
+        "time": now,
+        "diff": diff,
+    }
+
+@app.get("/api/audit/snapshot/{name}")
+async def get_config_snapshot(name: str):
+    snap = _config_snapshots.get(name)
+    if not snap: raise HTTPException(404, "No snapshot yet")
+    return snap
+
+@app.get("/api/audit/snapshots")
+async def list_snapshots():
+    return {
+        name: {
+            "hash": s.get("hash",""),
+            "time": s.get("time",""),
+            "changed": s.get("hash") != s.get("prev_hash",""),
+        }
+        for name, s in _config_snapshots.items()
+    }
+
+# ── IP Scanner ────────────────────────────────────────────────────
+@app.post("/api/audit/ipscan")
+async def ip_scan(req: dict):
+    """Quét subnet tìm IP đang hoạt động"""
+    subnet = req.get("subnet", "10.10.79.0/24")
+    import ipaddress, socket, concurrent.futures
+
+    try:
+        net = ipaddress.ip_network(subnet, strict=False)
+    except: raise HTTPException(400, "Subnet không hợp lệ")
+
+    hosts = list(net.hosts())[:254]  # Max 254 hosts
+
+    known_ips = {d.get("host") for d in devices_db.values()}
+
+    def check_host(ip):
+        ip_str = str(ip)
+        try:
+            sock = socket.create_connection((ip_str, 22), timeout=1)
+            sock.close()
+            port = 22
+        except:
+            try:
+                sock = socket.create_connection((ip_str, 80), timeout=1)
+                sock.close()
+                port = 80
+            except:
+                try:
+                    sock = socket.create_connection((ip_str, 443), timeout=1)
+                    sock.close()
+                    port = 443
+                except:
+                    return None
+        try:
+            hostname = socket.gethostbyaddr(ip_str)[0]
+        except: hostname = ""
+        return {
+            "ip": ip_str,
+            "port": port,
+            "hostname": hostname,
+            "known": ip_str in known_ips,
+            "new": ip_str not in known_ips,
+        }
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+        futures = {ex.submit(check_host, ip): ip for ip in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            r = future.result()
+            if r: results.append(r)
+
+    new_devices = [r for r in results if r["new"]]
+    if new_devices:
+        await send_alert_all(
+            f"🔍 <b>IP Scan Alert</b>\n"
+            f"Subnet: <b>{subnet}</b>\n"
+            f"🆕 {len(new_devices)} thiết bị lạ phát hiện:\n" +
+            "\n".join(f"  • {d['ip']} (port {d['port']})" for d in new_devices[:10])
+        )
+        add_audit_log("ip_scan", "network", "system", f"Found {len(new_devices)} unknown devices in {subnet}")
+
+    results.sort(key=lambda x: [int(p) for p in x["ip"].split(".")])
+    return {
+        "subnet": subnet,
+        "total_found": len(results),
+        "known": len([r for r in results if r["known"]]),
+        "new": len(new_devices),
+        "hosts": results,
+    }
