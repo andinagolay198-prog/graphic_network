@@ -2269,9 +2269,6 @@ def _health_check_loop():
             print(f"[HEALTH-CHECK] Loop error: {e}")
         _t.sleep(60)
 
-_hc_thread = _hc_threading.Thread(target=_health_check_loop, daemon=True)
-_hc_thread.start()
-print("[STARTUP] ✓ Health-check thread started (60s interval)")
 _startup_cleanup()
 
 # ── Background Health-Check ──────────────────────────────────────
