@@ -108,7 +108,7 @@ const Lbl=({children})=>(
 );
 function Toast({msg,type,onClose}){
   const c=type==="success"?G.green:type==="error"?G.red:G.yellow;
-  useEffect(()=>{const t=setTimeout(onClose,3800);return()=>clearTimeout(t);},[]);
+  useEffect(()=>{const t=setTimeout(onClose,3800);return()=>clearTimeout(t);},[onClose]);
   return(
     <div className="fadeIn" style={{position:"fixed",bottom:24,right:24,zIndex:9999,background:G.card,border:`1px solid ${c}55`,borderRadius:8,padding:"12px 16px",display:"flex",alignItems:"center",gap:10,boxShadow:"0 8px 32px #00000088",minWidth:300}}>
       <span style={{color:c,fontSize:14}}>{type==="success"?"✓":type==="error"?"✕":"⚠"}</span>
@@ -3223,10 +3223,47 @@ export default function App(){
 
   useEffect(()=>{
     if(!user) return;
+
+    // Sync lần đầu khi login
     const devs=STORE.get("devices",[]);
-    if(!devs.length) return;
-    api("/api/sync","POST",{devices:devs})
-      .then(r=>console.log("[sync]",r)).catch(()=>{});
+    if(devs.length){
+      api("/api/sync","POST",{devices:devs})
+        .then(r=>console.log("[sync]",r)).catch(()=>{});
+    }
+
+    // Pull status từ backend mỗi 30s
+    const pullStatus = async() => {
+      try{
+        const backendDevs = await api("/api/devices","GET");
+        if(!Array.isArray(backendDevs)) return;
+        setDevices(prev => {
+          const updated = prev.map(d => {
+            const b = backendDevs.find(x => x.name === d.name);
+            if(!b) return d;
+            return {...d,
+              status: b.status  || d.status,
+              cpu:    b.cpu     ?? d.cpu,
+              mem:    b.mem     ?? d.mem,
+              uptime: b.uptime  || d.uptime,
+              model:  b.model   || d.model,
+            };
+          });
+          const changed = updated.some((d,i) => d.status !== prev[i].status);
+          if(changed){
+            updated.forEach((d,i)=>{
+              if(d.status !== prev[i].status)
+                addLog("warn", `${d.name}: ${prev[i].status} → ${d.status}`);
+            });
+            STORE.set("devices", updated);
+          }
+          return updated;
+        });
+      }catch{ /* backend offline — giữ nguyên */ }
+    };
+
+    pullStatus();
+    const t = setInterval(pullStatus, 30000);
+    return () => clearInterval(t);
   },[user]);
 
   if(!user)return(<><style>{css}</style><LoginPage onLogin={setUser}/></>);
