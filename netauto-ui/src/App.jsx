@@ -33,7 +33,7 @@ const STORE = {
 };
 
 // ── API ──────────────────────────────────────────────────────────
-let API_BASE = STORE.get("api_url","http://localhost:8000");
+let API_BASE = STORE.get("api_url","http://localhost:8001");
 async function api(path, method="GET", body=null){
   const opts={method,headers:{"Content-Type":"application/json"}};
   if(body) opts.body=JSON.stringify(body);
@@ -2064,7 +2064,7 @@ function BackupPage({devices,toast}){
 
 // ── Settings ──────────────────────────────────────────────────────
 function SettingsPage({toast}){
-  const [apiUrl,setApiUrl]=useState(STORE.get("api_url","http://localhost:8000"));
+  const [apiUrl,setApiUrl]=useState(STORE.get("api_url","http://localhost:8001"));
   const [testing,setTesting]=useState(false);
   const [testResult,setTestResult]=useState(null);
 
@@ -2088,7 +2088,7 @@ function SettingsPage({toast}){
         <div style={{fontSize:13,fontWeight:700,marginBottom:16}}>Backend API</div>
         <Lbl>API URL</Lbl>
         <div style={{display:"flex",gap:10,marginBottom:12}}>
-          <Input value={apiUrl} onChange={e=>setApiUrl(e.target.value)} placeholder="http://localhost:8000"/>
+          <Input value={apiUrl} onChange={e=>setApiUrl(e.target.value)} placeholder="http://localhost:8001"/>
           <Btn variant="ghost" onClick={testApi} loading={testing} style={{flexShrink:0}}>Test</Btn>
         </div>
         {testResult&&<div style={{padding:"8px 12px",borderRadius:6,fontSize:12,fontFamily:FONT,marginBottom:12,background:testResult.ok?`${G.green}15`:`${G.red}15`,border:`1px solid ${testResult.ok?G.green:G.red}44`,color:testResult.ok?G.green:G.red}}>{testResult.msg}</div>}
