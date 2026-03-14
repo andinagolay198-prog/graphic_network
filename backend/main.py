@@ -2220,54 +2220,6 @@ def _startup_cleanup():
 # ── Background Health-Check ──────────────────────────────────────
 import threading as _hc_threading
 
-def _health_check_loop():
-    """Ping tất cả thiết bị mỗi 60s — tự phát hiện online/offline"""
-    import time as _t
-    import asyncio as _asyncio
-    _t.sleep(10)  # Chờ backend khởi động xong
-    print("[HEALTH-CHECK] Started — interval 60s")
-    while True:
-        try:
-            loop = _asyncio.new_event_loop()
-            _asyncio.set_event_loop(loop)
-            for name, device in list(devices_db.items()):
-                try:
-                    vendor = device.get("vendor","")
-                    prev = device.get("status","offline")
-                    ok = False
-                    # Quick TCP ping để check
-                    import socket
-                    host = device.get("host","")
-                    # Chọn port check theo vendor
-                    if vendor == "mikrotik":
-                        port = device.get("api_port", 3543)
-                    elif vendor == "fortinet":
-                        port = 443
-                    elif vendor == "sophos":
-                        port = 4444
-                    else:
-                        port = device.get("port", 22)
-                    try:
-                        sock = socket.create_connection((host, port), timeout=5)
-                        sock.close()
-                        ok = True
-                    except: ok = False
-
-                    new_status = "online" if ok else "offline"
-                    if new_status != prev:
-                        devices_db[name]["status"] = new_status
-                        save_db()
-                        print(f"[HEALTH-CHECK] {name}: {prev} → {new_status}")
-                        loop.run_until_complete(
-                            check_and_alert_status_change(name, new_status)
-                        )
-                        # Nếu back online → reconnect để lấy metrics
-                except Exception as e:
-                    print(f"[HEALTH-CHECK] {name} error: {e}")
-            loop.close()
-        except Exception as e:
-            print(f"[HEALTH-CHECK] Loop error: {e}")
-        _t.sleep(60)
 
 _startup_cleanup()
 
@@ -2302,9 +2254,24 @@ def _health_check_loop():
                     else:
                         port = device.get("port", 22)
                     try:
-                        sock = socket.create_connection((host, port), timeout=5)
-                        sock.close()
-                        ok = True
+                        if vendor == "cisco":
+                            from netmiko import ConnectHandler
+                            dt = device.get("device_type","ios")
+                            dt_map = {"ios":"cisco_ios","ios_xe":"cisco_xe","nx_os":"cisco_nxos"}
+                            tmp = ConnectHandler(
+                                device_type=dt_map.get(dt,"cisco_ios"),
+                                host=host,
+                                username=device.get("username","admin"),
+                                password=device.get("password",""),
+                                timeout=8,
+                            )
+                            tmp.find_prompt()
+                            tmp.disconnect()
+                            ok = True
+                        else:
+                            sock = socket.create_connection((host, port), timeout=5)
+                            sock.close()
+                            ok = True
                     except: ok = False
 
                     new_status = "online" if ok else "offline"
