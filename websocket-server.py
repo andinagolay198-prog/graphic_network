@@ -283,3 +283,25 @@ if __name__ == "__main__":
         port=8000,
         log_level="info"
     )
+
+@app.post("/api/topology/discover")
+async def topology_discover():
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(f"{PLNETWORK_URL}/api/topology/discover")
+            data = r.json()
+        await manager.broadcast({"type": "topology_update", "timestamp": datetime.now().isoformat(), "data": data})
+        return data
+    except httpx.TimeoutException:
+        return {"links": [], "interfaces": {}, "errors": {}, "error": "timeout"}
+    except Exception as e:
+        return {"links": [], "interfaces": {}, "errors": {}, "error": str(e)}
+
+@app.get("/api/devices/{device_id}/interfaces")
+async def get_device_interfaces(device_id: str):
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(f"{PLNETWORK_URL}/api/devices/{device_id}/interfaces")
+            return r.json()
+    except Exception as e:
+        return {"device_id": device_id, "interfaces": [], "error": str(e)}
