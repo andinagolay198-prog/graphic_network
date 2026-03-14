@@ -2716,7 +2716,7 @@ function SerialConsolePage({toast}){
       if(wsRef.current) wsRef.current.close();
       if(sessionId){
         // Use sendBeacon for reliable cleanup on page close
-        navigator.sendBeacon(`http://localhost:8000/api/serial/${sessionId}/close`);
+        navigator.sendBeacon(`${API_BASE}/api/serial/${sessionId}/close`);
       }
     };
     window.addEventListener("beforeunload", cleanup);
@@ -2785,7 +2785,7 @@ function SerialConsolePage({toast}){
       setSessionId(sid);
 
       // Then open WebSocket for streaming
-      const ws = new WebSocket(`ws://localhost:8000/ws/serial/${sid}`);
+      const ws = new WebSocket(`ws://${API_BASE.replace('http://','').replace('https://','')}/ws/serial/${sid}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
