@@ -1494,10 +1494,18 @@ async def stop_monitor():
 @app.get("/api/monitor/status")
 async def monitor_status():
     return {
-        "active": monitor_active,
+        "active": _poll_active,
         "interval": MONITOR_INTERVAL,
-        "thread_alive": monitor_thread.is_alive() if monitor_thread else False,
-        "devices_tracked": len(metrics_history)
+        "thread_alive": _poll_active,
+        "devices_tracked": len(_poll_configs),
+        "devices": {
+            name: {
+                "interval": _poll_configs.get(name),
+                "enabled":  name in _poll_configs,
+                "running":  name in _poll_jobs and _poll_jobs[name].is_alive(),
+            }
+            for name in _monitor_cfg
+        }
     }
 
 @app.get("/api/monitor/metrics")
