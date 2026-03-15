@@ -295,6 +295,71 @@ async def backup_device(name: str):
         raise HTTPException(400, str(e))
 
 # ── Ping / Traceroute ───────────────────────────────────────────
+@app.post("/api/devices/{name}/ping")
+async def ping_from_device(name: str, req: dict):
+    """Ping từ thiết bị MikroTik"""
+    device = devices_db.get(name)
+    if not device: raise HTTPException(404, "Device not found")
+    host = req.get("host","8.8.8.8")
+    count = req.get("count", 4)
+    src = req.get("src","")
+    if device.get("vendor","") == "mikrotik":
+        try:
+            result = await asyncio.to_thread(_mikrotik_ping, device, host, count, src)
+            return {"output": result, "host": host}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+    else:
+        # Cisco/others — dùng SSH command
+        try:
+            cmd = f"ping {host} repeat {count}"
+            r = await asyncio.to_thread(
+                lambda: __import__("netmiko").ConnectHandler(
+                    **{
+                        "device_type": "cisco_ios",
+                        "host": device["host"],
+                        "username": device["username"],
+                        "password": device["password"],
+                        "timeout": 15,
+                    }
+                ).send_command(cmd)
+            )
+            return {"output": r, "host": host}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+@app.post("/api/devices/{name}/traceroute")
+async def traceroute_from_device(name: str, req: dict):
+    """Traceroute từ thiết bị MikroTik"""
+    device = devices_db.get(name)
+    if not device: raise HTTPException(404, "Device not found")
+    host = req.get("host","8.8.8.8")
+    count = req.get("count", 3)
+    if device.get("vendor","") == "mikrotik":
+        try:
+            from routeros_api import RouterOsApiPool
+            def _trace():
+                pool = RouterOsApiPool(
+                    device["host"], username=device["username"],
+                    password=device["password"],
+                    port=device.get("api_port",3543),
+                    plaintext_login=True, use_ssl=False
+                )
+                api = pool.get_api()
+                result = api.get_resource("/tool/traceroute").call(
+                    "traceroute", {"address": host, "count": str(count)}
+                )
+                pool.disconnect()
+                lines = []
+                for r in result:
+                    lines.append(f"  {r.get('n','?')}  {r.get('time','?')}ms  {r.get('address','?')}")
+                return "\n".join(lines)
+            output = await asyncio.to_thread(_trace)
+            return {"output": output, "host": host}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+    raise HTTPException(400, "Traceroute chỉ hỗ trợ MikroTik")
+
 @app.post("/api/network/ping")
 async def ping_host(req: PingRequest):
     """Ping từ server đến host"""
@@ -4205,7 +4270,42 @@ async def ip_scan(req: dict):
 
     hosts = list(net.hosts())[:254]  # Max 254 hosts
 
-    known_ips = {d.get("host") for d in devices_db.values()}
+    import ipaddress as _iplib
+
+    def _is_private(ip):
+        try:
+            return _iplib.ip_address(ip).is_private
+        except: return False
+
+    def _is_public(ip):
+        try:
+            a = _iplib.ip_address(ip)
+            return not a.is_private and not a.is_loopback and not a.is_link_local
+        except: return False
+
+    def _is_gateway(ip):
+        """IP .1 hoặc .254 của subnet thường là gateway"""
+        try:
+            last = int(ip.split(".")[-1])
+            return last in (1, 254)
+        except: return False
+
+    # Tập hợp IP đã biết từ devices_db
+    known_ips = set()
+    for d in devices_db.values():
+        host = d.get("host","")
+        if host: known_ips.add(host)
+        # Thêm local IP của thiết bị nếu có
+        if d.get("local_ip"): known_ips.add(d["local_ip"])
+
+    # Thêm gateway (.1) của subnet đang scan
+    try:
+        net2 = _iplib.ip_network(subnet, strict=False)
+        hosts_list = list(net2.hosts())
+        if hosts_list:
+            known_ips.add(str(hosts_list[0]))   # .1 gateway
+            known_ips.add(str(hosts_list[-1]))   # .254 gateway
+    except: pass
 
     def check_host(ip):
         ip_str = str(ip)
@@ -4228,12 +4328,19 @@ async def ip_scan(req: dict):
         try:
             hostname = socket.gethostbyaddr(ip_str)[0]
         except: hostname = ""
+        # Phân loại IP
+        is_known = ip_str in known_ips
+        is_gw = _is_gateway(ip_str)
+        is_pub = _is_public(ip_str)
+        if is_gw: is_known = True  # Gateway luôn là known
+
         return {
             "ip": ip_str,
             "port": port,
             "hostname": hostname,
-            "known": ip_str in known_ips,
-            "new": ip_str not in known_ips,
+            "known": is_known,
+            "new": not is_known,
+            "type": "gateway" if is_gw else ("public" if is_pub else "local"),
         }
 
     results = []
