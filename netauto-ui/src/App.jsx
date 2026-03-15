@@ -536,7 +536,7 @@ function DevicesPage({devices,setDevices,toast}){
       setPwPrompt(null);
     }catch(e){
       const errStr=String(e).toLowerCase();
-      const isAuth=errStr.includes("password")||errStr.includes("invalid user")||errStr.includes("authentication")||errStr.includes("login");
+      const isAuth=errStr.includes("password")||errStr.includes("invalid user")||errStr.includes("authentication")||errStr.includes("login")||errStr.includes("http 400")||errStr.includes("400");
       if(isAuth){
         setPwPrompt(device);
         setConnecting(p=>({...p,[id]:false}));

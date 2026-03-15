@@ -2649,6 +2649,7 @@ async def telegram_webhook(req: dict):
                 key = ":".join(parts[1:])
                 import time as _tt
                 _alert_acknowledged[key] = _tt.time()
+                _save_ack()
                 await tg_answer_callback(cb_id, "✅ Đã xác nhận — tắt alert 1h")
                 await tg_edit_message(chat_id, msg_id,
                     f"✅ <b>Đã xác nhận</b>\nAlert <code>{key}</code> đã tắt trong <b>1 giờ</b>",
@@ -2657,6 +2658,7 @@ async def telegram_webhook(req: dict):
                 key = ":".join(parts[1:])
                 import time as _tt
                 _alert_acknowledged[key] = _tt.time() + 82800  # 23h thêm = tổng 24h
+                _save_ack()
                 await tg_answer_callback(cb_id, "🔕 Đã tắt alert 24h")
                 await tg_edit_message(chat_id, msg_id,
                     f"🔕 <b>Tắt 24h</b>\nAlert <code>{key}</code> đã tắt trong <b>24 giờ</b>",
@@ -3355,7 +3357,24 @@ THRESHOLD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thres
 _thresholds: dict = {}          # {device_name: {cpu, mem, bw_mbps, ...}}
 _alert_cooldown: dict = {}
 _alert_acknowledged: dict = {}  # key → timestamp khi user xác nhận
-ALERT_ACK_DURATION = 3600  # Sau 1h mới alert lại dù đã xác nhận      # {key: last_alert_ts}
+ALERT_ACK_DURATION = 3600  # Sau 1h mới alert lại dù đã xác nhận
+ALERT_ACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_ack.json")
+
+def _load_ack():
+    global _alert_acknowledged
+    if os.path.exists(ALERT_ACK_FILE):
+        try:
+            with open(ALERT_ACK_FILE) as f:
+                _alert_acknowledged = json.load(f)
+        except: pass
+
+def _save_ack():
+    try:
+        with open(ALERT_ACK_FILE,"w") as f:
+            json.dump(_alert_acknowledged, f)
+    except: pass
+
+_load_ack()
 ALERT_COOLDOWN_SEC = 300        # 5 phút không spam
 
 def _load_thresholds():
