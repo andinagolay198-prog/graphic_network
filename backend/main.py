@@ -2645,7 +2645,23 @@ async def telegram_webhook(req: dict):
         parts = data.split(":", 2)
         action = parts[0]
         try:
-            if action == "menu":
+            if action == "ack":
+                key = ":".join(parts[1:])
+                import time as _tt
+                _alert_acknowledged[key] = _tt.time()
+                await tg_answer_callback(cb_id, "✅ Đã xác nhận — tắt alert 1h")
+                await tg_edit_message(chat_id, msg_id,
+                    f"✅ <b>Đã xác nhận</b>\nAlert <code>{key}</code> đã tắt trong <b>1 giờ</b>",
+                    {"inline_keyboard":[[{"text":"🔕 Tắt 24h","callback_data":f"ack24:{key}"},{"text":"↩ Menu","callback_data":"menu:main"}]]})
+            elif action == "ack24":
+                key = ":".join(parts[1:])
+                import time as _tt
+                _alert_acknowledged[key] = _tt.time() + 82800  # 23h thêm = tổng 24h
+                await tg_answer_callback(cb_id, "🔕 Đã tắt alert 24h")
+                await tg_edit_message(chat_id, msg_id,
+                    f"🔕 <b>Tắt 24h</b>\nAlert <code>{key}</code> đã tắt trong <b>24 giờ</b>",
+                    {"inline_keyboard":[[{"text":"↩ Menu","callback_data":"menu:main"}]]})
+            elif action == "menu":
                 sub = parts[1] if len(parts)>1 else ""
                 if sub == "main":
                     await tg_edit_message(chat_id, msg_id, "🌐 <b>PlNetwork Auto Manager</b>\nChọn chức năng:", kb_main_menu())
@@ -3337,7 +3353,9 @@ def _collect_device(name: str, device: dict):
 # ── Threshold config ──────────────────────────────────────────────
 THRESHOLD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json")
 _thresholds: dict = {}          # {device_name: {cpu, mem, bw_mbps, ...}}
-_alert_cooldown: dict = {}      # {key: last_alert_ts}
+_alert_cooldown: dict = {}
+_alert_acknowledged: dict = {}  # key → timestamp khi user xác nhận
+ALERT_ACK_DURATION = 3600  # Sau 1h mới alert lại dù đã xác nhận      # {key: last_alert_ts}
 ALERT_COOLDOWN_SEC = 300        # 5 phút không spam
 
 def _load_thresholds():
@@ -3363,16 +3381,39 @@ def _check_thresholds(name: str, cpu: float, mem: float, interfaces: list):
         return
 
     def _alert(key: str, msg: str):
-        now = _time.time()
+        import time as _tt
+        now = _tt.time()
+        # Kiểm tra cooldown
         last = _alert_cooldown.get(key, 0)
         if now - last < ALERT_COOLDOWN_SEC:
             return
+        # Kiểm tra đã được xác nhận chưa
+        ack_time = _alert_acknowledged.get(key, 0)
+        if now - ack_time < ALERT_ACK_DURATION:
+            return
         _alert_cooldown[key] = now
-        full_msg = f"⚠️ <b>PlNetwork Alert</b>\n🖥 <b>{name}</b>\n{msg}"
+        full_msg = f"⚠️ <b>PlNetwork Alert</b>\n🖥 <b>{name}</b>\n{msg}\n\n<i>Nhấn Xác Nhận để tắt cảnh báo này 1h</i>"
+        # Inline keyboard với nút Xác Nhận
+        keyboard = {"inline_keyboard": [[
+            {"text": "✅ Xác Nhận đã biết", "callback_data": f"ack:{key}"},
+            {"text": "🔕 Tắt 24h", "callback_data": f"ack24:{key}"},
+        ]]}
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.run_coroutine_threadsafe(send_alert_all(full_msg), loop)
+            import asyncio as _aio
+            async def _send():
+                token = bot_config.get("token","")
+                if not token: return
+                import httpx
+                async with httpx.AsyncClient(timeout=10) as client:
+                    for chat_id in bot_config.get("alert_chats",[]):
+                        await client.post(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            json={"chat_id": chat_id, "text": full_msg,
+                                  "parse_mode": "HTML", "reply_markup": keyboard}
+                        )
+            loop = _aio.new_event_loop()
+            loop.run_until_complete(_send())
+            loop.close()
         except Exception as e:
             print(f"[Alert] {e}")
 
@@ -4368,3 +4409,36 @@ async def ip_scan(req: dict):
         "new": len(new_devices),
         "hosts": results,
     }
+
+# ── Schedule Config API ───────────────────────────────────────────
+@app.get("/api/schedule/config")
+async def get_schedule_config():
+    return {
+        **_schedule_cfg,
+        "backup_active": backup_schedule_active,
+        "backup_interval_hours": BACKUP_INTERVAL_HOURS,
+    }
+
+@app.post("/api/schedule/config")
+async def save_schedule_config(req: dict):
+    global backup_schedule_active, backup_schedule_thread, BACKUP_INTERVAL_HOURS
+    _schedule_cfg.update(req)
+    _save_schedule_config()
+    # Apply backup schedule
+    if req.get("backup_enabled"):
+        BACKUP_INTERVAL_HOURS = req.get("backup_hours", 24)
+        if not backup_schedule_active:
+            backup_schedule_active = True
+            backup_schedule_thread = _threading.Thread(target=_backup_schedule_loop, daemon=True)
+            backup_schedule_thread.start()
+            print(f"[SCHEDULE] Backup started every {BACKUP_INTERVAL_HOURS}h")
+    else:
+        backup_schedule_active = False
+    return {"status": "ok", **_schedule_cfg}
+
+@app.post("/api/schedule/backup/now")
+async def backup_now():
+    """Trigger manual backup ngay lập tức"""
+    results = await asyncio.to_thread(_backup_all_sync)
+    add_audit_log("backup", "all", "manual", f"Manual backup: {len(results)} devices")
+    return {"status": "done", "results": results}
