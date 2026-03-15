@@ -3525,8 +3525,7 @@ function SecurityPage({devices,toast}){
                   <pre style={{fontFamily:FONT,fontSize:11,color:G.text,whiteSpace:"pre-wrap",
                     lineHeight:1.75,maxHeight:420,overflowY:"auto",
                     background:G.surface,padding:12,borderRadius:6}}>
-                    {diffResult.diff.split("
-").map((line,i)=>(
+                    {diffResult.diff.split("\n").map((line,i)=>(
                       <span key={i} style={{
                         color:line.startsWith("+")?G.green:line.startsWith("-")?G.red:line.startsWith("@@")?G.accent:G.dim,
                         display:"block"
