@@ -183,6 +183,8 @@ const NAV=[
   {id:"serial",    icon:"⊛",label:"Console RS232"},
   {id:"botconfig", icon:"✈",label:"Telegram Bot"},
   {id:"settings",  icon:"✦",label:"Settings"},
+  {id:"audit",     icon:"🔐",label:"Audit Log"},
+  {id:"security",  icon:"🔍",label:"IP Scanner"},
 ];
 function Sidebar({page,onNav,user,onLogout,devices}){
   const online=devices.filter(d=>d.status==="online").length;
@@ -3214,6 +3216,337 @@ function TelegramBotPage({toast}){
   );
 }
 
+// ── Audit Log Page ───────────────────────────────────────────────
+function AuditPage({toast}){
+  const [logs,setLogs]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [filter,setFilter]=useState("all");
+  const [search,setSearch]=useState("");
+
+  const fetchLogs=async()=>{
+    setLoading(true);
+    try{
+      const r=await api("/api/audit/logs?limit=200");
+      setLogs(r.logs||[]);
+    }catch{toast("error","Không load được audit log");}
+    setLoading(false);
+  };
+
+  const clearLogs=async()=>{
+    try{
+      await api("/api/audit/logs","DELETE");
+      setLogs([]);
+      toast("success","Đã xóa audit log");
+    }catch{toast("error","Lỗi xóa log");}
+  };
+
+  useEffect(()=>{fetchLogs();},[]);
+
+  const ACTIONS=["all","config_push","config_change","rollback","device_delete","service_change","ip_scan","connect"];
+  const filtered=logs.filter(l=>{
+    const matchFilter=filter==="all"||l.action===filter;
+    const matchSearch=!search||l.device?.toLowerCase().includes(search.toLowerCase())||l.detail?.toLowerCase().includes(search.toLowerCase());
+    return matchFilter&&matchSearch;
+  });
+
+  const actionColor=(a)=>{
+    if(a==="config_change")return G.yellow;
+    if(a==="rollback"||a==="device_delete")return G.red;
+    if(a==="config_push"||a==="service_change")return G.orange;
+    if(a==="ip_scan")return G.accent;
+    if(a==="connect")return G.green;
+    return G.dim;
+  };
+
+  return(
+    <div className="fadeIn" style={{padding:28}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+        <div>
+          <div style={{fontSize:22,fontWeight:700}}>🔐 Audit Log</div>
+          <div style={{fontSize:12,color:G.muted,marginTop:3}}>{logs.length} sự kiện được ghi nhận</div>
+        </div>
+        <div style={{display:"flex",gap:10}}>
+          <Btn variant="ghost" onClick={fetchLogs} loading={loading}>↻ Refresh</Btn>
+          <Btn variant="danger" onClick={clearLogs}>🗑 Xóa Log</Btn>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+        {ACTIONS.map(a=>(
+          <div key={a} onClick={()=>setFilter(a)}
+            style={{padding:"5px 12px",borderRadius:5,cursor:"pointer",fontSize:11,fontFamily:FONT,
+              background:filter===a?`${actionColor(a)}22`:G.card,
+              border:`1px solid ${filter===a?actionColor(a)+"55":G.border}`,
+              color:filter===a?actionColor(a):G.muted,transition:"all .15s"}}>
+            {a==="all"?"Tất cả":a}
+          </div>
+        ))}
+        <Input value={search} onChange={e=>setSearch(e.target.value)}
+          placeholder="Tìm thiết bị, chi tiết..."
+          style={{marginLeft:"auto",width:240}}/>
+      </div>
+
+      {/* Log table */}
+      <Card style={{padding:0,overflow:"hidden"}}>
+        {filtered.length===0?(
+          <div style={{padding:48,textAlign:"center",color:G.muted,fontSize:13}}>
+            {loading?"Đang tải...":"Chưa có log nào"}
+          </div>
+        ):(
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead>
+              <tr style={{background:G.surface}}>
+                {["Thời gian","Action","Thiết bị","User","Chi tiết","Status"].map(h=>(
+                  <th key={h} style={{padding:"10px 14px",textAlign:"left",fontSize:10,
+                    color:G.muted,fontFamily:FONT,letterSpacing:"0.06em",
+                    borderBottom:`1px solid ${G.border}`,fontWeight:500}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((l,i)=>(
+                <tr key={i} style={{borderBottom:`1px solid ${G.border}`}}
+                  onMouseEnter={e=>e.currentTarget.style.background=G.surface}
+                  onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                  <td style={{padding:"10px 14px",fontFamily:FONT,fontSize:11,color:G.muted,whiteSpace:"nowrap"}}>
+                    {new Date(l.time).toLocaleString("vi-VN")}
+                  </td>
+                  <td style={{padding:"10px 14px"}}>
+                    <span style={{padding:"2px 8px",borderRadius:3,fontSize:10,fontFamily:FONT,
+                      background:`${actionColor(l.action)}18`,color:actionColor(l.action),
+                      border:`1px solid ${actionColor(l.action)}33`}}>{l.action}</span>
+                  </td>
+                  <td style={{padding:"10px 14px",fontFamily:FONT,fontSize:12,color:G.text}}>{l.device||"—"}</td>
+                  <td style={{padding:"10px 14px",fontSize:11,color:G.dim}}>{l.user||"—"}</td>
+                  <td style={{padding:"10px 14px",fontSize:11,color:G.dim,maxWidth:300,
+                    overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.detail||"—"}</td>
+                  <td style={{padding:"10px 14px"}}>
+                    <span style={{color:l.status==="ok"?G.green:G.red,fontSize:11}}>
+                      {l.status==="ok"?"✓":"✕"}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// ── Security / IP Scanner Page ────────────────────────────────────
+function SecurityPage({devices,toast}){
+  const [subnet,setSubnet]=useState("10.10.79.0/24");
+  const [scanning,setScanning]=useState(false);
+  const [results,setResults]=useState(null);
+  const [snapshots,setSnapshots]=useState({});
+  const [diffResult,setDiffResult]=useState(null);
+  const [diffLoading,setDiffLoading]=useState({});
+  const [tab,setTab]=useState("ipscan");
+
+  const fetchSnapshots=async()=>{
+    try{const r=await api("/api/audit/snapshots");setSnapshots(r);}catch{}
+  };
+
+  useEffect(()=>{fetchSnapshots();},[]);
+
+  const doScan=async()=>{
+    setScanning(true);setResults(null);
+    try{
+      const r=await api("/api/audit/ipscan","POST",{subnet});
+      setResults(r);
+      toast("success",`Scan xong! ${r.total_found} thiết bị, ${r.new} lạ`);
+    }catch(e){toast("error",String(e));}
+    setScanning(false);
+  };
+
+  const takeSnapshot=async(name)=>{
+    setDiffLoading(p=>({...p,[name]:true}));
+    try{
+      const r=await api(`/api/audit/snapshot/${encodeURIComponent(name)}`,"POST");
+      setDiffResult(r);
+      fetchSnapshots();
+      if(r.changed) toast("warn",`Config thay đổi: ${name}!`);
+      else toast("success",`Config không thay đổi: ${name}`);
+    }catch(e){toast("error",String(e));}
+    setDiffLoading(p=>({...p,[name]:false}));
+  };
+
+  return(
+    <div className="fadeIn" style={{padding:28}}>
+      <div style={{marginBottom:22}}>
+        <div style={{fontSize:22,fontWeight:700}}>🔍 Security</div>
+        <div style={{fontSize:12,color:G.muted,marginTop:3}}>IP Scanner · Config Diff · Change Detection</div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{display:"flex",gap:8,marginBottom:20}}>
+        {[["ipscan","🔍 IP Scanner"],["configdiff","📋 Config Diff"]].map(([id,label])=>(
+          <div key={id} onClick={()=>setTab(id)}
+            style={{padding:"8px 18px",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:600,
+              background:tab===id?`${G.accent}22`:G.card,
+              border:`1px solid ${tab===id?G.accent+"66":G.border}`,
+              color:tab===id?G.accent:G.muted,transition:"all .15s"}}>
+            {label}
+          </div>
+        ))}
+      </div>
+
+      {/* IP Scanner */}
+      {tab==="ipscan"&&(
+        <div style={{display:"grid",gridTemplateColumns:"360px 1fr",gap:16}}>
+          <Card>
+            <div style={{fontSize:12,color:G.muted,fontFamily:FONT,letterSpacing:"0.06em",marginBottom:14}}>SCAN CONFIG</div>
+            <Lbl>Subnet</Lbl>
+            <Input value={subnet} onChange={e=>setSubnet(e.target.value)}
+              placeholder="192.168.1.0/24" onKeyDown={e=>e.key==="Enter"&&doScan()}/>
+            <div style={{marginTop:8,fontSize:11,color:G.muted,fontFamily:FONT,lineHeight:1.8}}>
+              Quét TCP port 22/80/443<br/>
+              Phát hiện thiết bị lạ → alert Telegram
+            </div>
+            <Btn onClick={doScan} loading={scanning}
+              style={{marginTop:14,width:"100%",justifyContent:"center"}}>
+              {scanning?"Đang quét...":"🔍 Bắt đầu Scan"}
+            </Btn>
+            {results&&(
+              <div style={{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}}>
+                {[["Total",results.total_found,G.text],["Known",results.known,G.green],["New/Lạ",results.new,results.new>0?G.red:G.muted]].map(([l,v,c])=>(
+                  <div key={l} style={{flex:1,padding:"8px",background:G.surface,borderRadius:6,textAlign:"center",border:`1px solid ${G.border}`}}>
+                    <div style={{fontSize:20,fontWeight:800,color:c,fontFamily:FONT}}>{v}</div>
+                    <div style={{fontSize:10,color:G.muted}}>{l}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          <Card style={{padding:0,overflow:"hidden"}}>
+            <div style={{padding:"12px 16px",borderBottom:`1px solid ${G.border}`,fontSize:11,color:G.muted,fontFamily:FONT,letterSpacing:"0.06em"}}>
+              KẾT QUẢ SCAN {results?`— ${results.subnet}`:""}
+            </div>
+            {!results?(
+              <div style={{padding:48,textAlign:"center",color:G.muted,fontSize:13}}>
+                Nhập subnet và nhấn Scan
+              </div>
+            ):(
+              <div style={{maxHeight:500,overflowY:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr style={{background:G.surface}}>
+                      {["IP","Port","Hostname","Status"].map(h=>(
+                        <th key={h} style={{padding:"8px 14px",textAlign:"left",fontSize:10,
+                          color:G.muted,fontFamily:FONT,borderBottom:`1px solid ${G.border}`,fontWeight:500}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.hosts.map((h,i)=>(
+                      <tr key={i} style={{borderBottom:`1px solid ${G.border}`,
+                        background:h.new?`${G.red}08`:"transparent"}}
+                        onMouseEnter={e=>e.currentTarget.style.background=h.new?`${G.red}15`:G.surface}
+                        onMouseLeave={e=>e.currentTarget.style.background=h.new?`${G.red}08`:"transparent"}>
+                        <td style={{padding:"8px 14px",fontFamily:FONT,fontSize:12,color:h.new?G.red:G.text,fontWeight:h.new?700:400}}>
+                          {h.new&&"⚠ "}{h.ip}
+                        </td>
+                        <td style={{padding:"8px 14px",fontFamily:FONT,fontSize:11,color:G.dim}}>{h.port}</td>
+                        <td style={{padding:"8px 14px",fontSize:11,color:G.muted}}>{h.hostname||"—"}</td>
+                        <td style={{padding:"8px 14px"}}>
+                          <span style={{padding:"2px 8px",borderRadius:3,fontSize:10,fontFamily:FONT,
+                            background:h.known?`${G.green}18`:`${G.red}18`,
+                            color:h.known?G.green:G.red,
+                            border:`1px solid ${h.known?G.green:G.red}33`}}>
+                            {h.known?"Known":"⚠ NEW"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+
+      {/* Config Diff */}
+      {tab==="configdiff"&&(
+        <div style={{display:"grid",gridTemplateColumns:"320px 1fr",gap:16}}>
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {devices.filter(d=>d.status==="online").map(d=>{
+              const snap=snapshots[d.name];
+              return(
+                <Card key={d.name} style={{borderColor:snap?.changed?`${G.yellow}44`:G.border}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:13}}>{d.name}</div>
+                      <VChip vendor={d.vendor}/>
+                    </div>
+                    {snap?.changed&&<Badge color={G.yellow} small>CHANGED</Badge>}
+                  </div>
+                  {snap?(
+                    <div style={{fontSize:10,color:G.muted,fontFamily:FONT,marginBottom:10,lineHeight:1.8}}>
+                      Snapshot: {new Date(snap.time).toLocaleString("vi-VN")}<br/>
+                      Hash: {snap.hash?.substring(0,8)}...
+                    </div>
+                  ):(
+                    <div style={{fontSize:11,color:G.muted,marginBottom:10}}>Chưa có snapshot</div>
+                  )}
+                  <Btn onClick={()=>takeSnapshot(d.name)} loading={diffLoading[d.name]}
+                    variant={snap?.changed?"warning":"ghost"}
+                    style={{width:"100%",justifyContent:"center",fontSize:11}}>
+                    {snap?"📸 Update Snapshot":"📸 Lấy Snapshot"}
+                  </Btn>
+                </Card>
+              );
+            })}
+            {devices.filter(d=>d.status==="online").length===0&&(
+              <Card><div style={{color:G.muted,fontSize:13}}>Không có thiết bị online</div></Card>
+            )}
+          </div>
+
+          <Card style={{background:"#05070b"}}>
+            <div style={{fontSize:11,color:G.muted,fontFamily:FONT,letterSpacing:"0.06em",marginBottom:12}}>CONFIG DIFF</div>
+            {!diffResult?(
+              <div style={{color:G.muted,fontSize:13,textAlign:"center",padding:40}}>
+                Nhấn "Lấy Snapshot" để so sánh config
+              </div>
+            ):(
+              <div>
+                <div style={{display:"flex",gap:10,marginBottom:12,alignItems:"center"}}>
+                  <Badge color={diffResult.changed?G.yellow:G.green}>
+                    {diffResult.changed?"CONFIG CHANGED":"NO CHANGE"}
+                  </Badge>
+                  <span style={{fontSize:11,color:G.muted,fontFamily:FONT}}>{diffResult.name}</span>
+                  <span style={{fontSize:10,color:G.muted,marginLeft:"auto"}}>{new Date(diffResult.time).toLocaleString("vi-VN")}</span>
+                </div>
+                {diffResult.diff?(
+                  <pre style={{fontFamily:FONT,fontSize:11,color:G.text,whiteSpace:"pre-wrap",
+                    lineHeight:1.75,maxHeight:420,overflowY:"auto",
+                    background:G.surface,padding:12,borderRadius:6}}>
+                    {diffResult.diff.split("
+").map((line,i)=>(
+                      <span key={i} style={{
+                        color:line.startsWith("+")?G.green:line.startsWith("-")?G.red:line.startsWith("@@")?G.accent:G.dim,
+                        display:"block"
+                      }}>{line}</span>
+                    ))}
+                  </pre>
+                ):(
+                  <div style={{color:G.green,fontSize:13,textAlign:"center",padding:20}}>
+                    ✓ Config không thay đổi so với snapshot trước
+                  </div>
+                )}
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App(){
   const [user,setUser]=useState(null);
   const [page,setPage]=useState("dashboard");
@@ -3281,6 +3614,8 @@ export default function App(){
     serial:<SerialConsolePage toast={toast}/>,
     botconfig:<TelegramBotPage toast={toast}/>,
     settings:<SettingsPage toast={toast}/>,
+    audit:<AuditPage toast={toast}/>,
+    security:<SecurityPage devices={devices} toast={toast}/>,
   };
 
   return(
