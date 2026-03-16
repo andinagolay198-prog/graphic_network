@@ -2326,26 +2326,34 @@ def _health_check_loop():
                         port = 4444
                     else:
                         port = device.get("port", 22)
-                    try:
-                        if vendor == "cisco":
-                            from netmiko import ConnectHandler
-                            dt = device.get("device_type","ios")
-                            dt_map = {"ios":"cisco_ios","ios_xe":"cisco_xe","nx_os":"cisco_nxos"}
-                            tmp = ConnectHandler(
-                                device_type=dt_map.get(dt,"cisco_ios"),
-                                host=host,
-                                username=device.get("username","admin"),
-                                password=device.get("password",""),
-                                timeout=8,
-                            )
-                            tmp.find_prompt()
-                            tmp.disconnect()
-                            ok = True
-                        else:
-                            sock = socket.create_connection((host, port), timeout=5)
-                            sock.close()
-                            ok = True
-                    except: ok = False
+                    # Thử 2 lần trước khi kết luận offline
+                    for _attempt in range(2):
+                        try:
+                            if vendor == "cisco":
+                                from netmiko import ConnectHandler
+                                dt = device.get("device_type","ios")
+                                dt_map = {"ios":"cisco_ios","ios_xe":"cisco_xe","nx_os":"cisco_nxos"}
+                                tmp = ConnectHandler(
+                                    device_type=dt_map.get(dt,"cisco_ios"),
+                                    host=host,
+                                    username=device.get("username","admin"),
+                                    password=device.get("password",""),
+                                    timeout=15,
+                                )
+                                tmp.find_prompt()
+                                tmp.disconnect()
+                                ok = True
+                                break
+                            else:
+                                sock = socket.create_connection((host, port), timeout=8)
+                                sock.close()
+                                ok = True
+                                break
+                        except:
+                            ok = False
+                            if _attempt == 0:
+                                import time as _tt2
+                                _tt2.sleep(5)  # Chờ 5s rồi thử lại
 
                     new_status = "online" if ok else "offline"
                     if new_status != prev:
@@ -2873,7 +2881,8 @@ async def check_and_alert_status_change(name: str, new_status: str):
         if new_status == "offline":
             await send_alert_all(f"🔴 <b>ALERT: {name} went OFFLINE</b>\n⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
             await send_alert_all(f"🟢 <b>ALERT: {name} back ONLINE</b>\n⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
-    device_prev_status[name] = new_status
+        elif new_status == "online":
+            await send_alert_all(f"🟢 <b>ALERT: {name} back ONLINE</b>\n⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
 
 
 # ══════════════════════════════════════════════════════════════════
